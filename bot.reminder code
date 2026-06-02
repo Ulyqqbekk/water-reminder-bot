@@ -1,7 +1,9 @@
 import os
 import random
+import threading
 from datetime import time, datetime
 from zoneinfo import ZoneInfo
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -31,10 +33,198 @@ MOTIVATIONS = [
     "Давай-давай, один стакан и ты красавчик 💧",
 ]
 
-
 states: dict[int, dict] = {}
 
 def today_key() -> str:
+    return datetime.now(TZ).date().isoformat()
+
+def ensure_state(chat_id: int) -> dict:
+    tk = today_key()
+    st = states.get(chat_id)
+    if not st or st.get("date") != tk:
+        st = {"date": tk, "done": set(), "count": 0}
+        states[chat_id] = st
+    return st
+
+def total_glasses_per_day() -> int:
+    return sum(glasses for _, glasses, *_ in SCHEDULE)
+
+TOTAL = total_glasses_per_day()
+
+SLOT_GLASSES = {t.strftime("%H:%M"): glasses for (t, glasses, *_ ) in SCHEDULE}
+
+def plan_text() -> str:
+    lines = ["Расписание на день:"]
+    total = 0
+    for t, glasses, repeat_for, every in SCHEDULE:
+        total += glasses
+        if repeat_for and repeat_for > 0:
+            lines.append(f"• {t.strftime('%H:%M')} — {glasses} стак. (повтор каждые {every} мин, {repeat_for} мин)")
+        else:
+            lines.append(f"• {t.strftime('%H:%M')} — {glasses} стак.")
+    lines.append(f"Итого: {total} стаканов/день")
+    return "\n".join(lines)
+
+def progress_line(chat_id: int) -> str:
+    st = ensure_state(chat_id)
+    return f"Сегодня: {st['count']}/{TOTAL} стаканов 💧"
+
+def done_keyboard(slot_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Выпил", callback_data=f"done|{slot_id}")]
+    ])
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Я бот-напоминалка воды 💧\n"
+        "Команды:\n"
+        "/on — включить напоминания (для этого чата)\n"
+        "/off — выключить\n"
+        "/plan — показать расписание\n"
+        "/status — прогресс на сегодня\n"
+    )
+
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    await update.message.reply_text(progress_line(chat_id))
+
+async def plan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    await update.message.reply_text(plan_text() + "\n\n" + progress_line(chat_id))
+
+async def send_water_reminder(context: ContextTypes.DEFAULT_TYPE):
+    job = context.job
+    chat_id = job.chat_id
+    slot_id = job.data["slot_id"]
+    label = job.data["label"]
+    glasses = job.data["glasses"]
+    st = ensure_state(chat_id)
+    if slot_id in st["done"]:
+        return
+    motivation = random.choice(MOTIVATIONS)
+    text = (
+        f"💧 Вода: выпей {glasses} стакан(а/ов).\n"
+        f"🕒 Сейчас по плану: {label}\n"
+        f"{motivation}\n\n"
+        f"{progress_line(chat_id)}"
+    )
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=done_keyboard(slot_id),
+    )
+
+def schedule_for_chat(app: Application, chat_id: int):
+    for job in app.job_queue.get_jobs_by_name(str(chat_id)):
+        job.schedule_removal()
+    for t, glasses, repeat_for_minutes, every_minutes in SCHEDULE:
+        slot_id = t.strftime("%H:%M")
+        app.job_queue.run_daily(
+            send_water_reminder,
+            time=t,
+            days=(0, 1, 2, 3, 4, 5, 6),
+            name=str(chat_id),
+            chat_id=chat_id,
+            data={"glasses": glasses, "slot_id": slot_id, "label": slot_id},
+            timezone=TZ,
+        )
+        if repeat_for_minutes and repeat_for_minutes > 0:
+            repeats = repeat_for_minutes // every_minutes
+            base_minutes = t.hour * 60 + t.minute
+            for k in range(1, repeats + 1):
+                shifted = base_minutes + k * every_minutes
+                hh = (shifted // 60) % 24
+                mm = shifted % 60
+                shifted_time = time(hh, mm)
+                label = shifted_time.strftime("%H:%M")
+                app.job_queue.run_daily(
+                    send_water_reminder,
+                    time=shifted_time,
+                    days=(0, 1, 2, 3, 4, 5, 6),
+                    name=str(chat_id),
+                    chat_id=chat_id,
+                    data={"glasses": glasses, "slot_id": slot_id, "label": label},
+                    timezone=TZ,
+                )
+
+async def on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    schedule_for_chat(context.application, chat_id)
+    await update.message.reply_text("✅ Напоминания включены!\n\n" + plan_text() + "\n\n" + progress_line(chat_id))
+
+async def off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    removed = 0
+    for job in context.application.job_queue.get_jobs_by_name(str(chat_id)):
+        job.schedule_removal()
+        removed += 1
+    await update.message.reply_text(f"🛑 Напоминания выключены. Удалено задач: {removed}")
+
+async def done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+    chat_id = query.message.chat_id
+    st = ensure_state(chat_id)
+    data = query.data or ""
+    parts = data.split("|", 1)
+    if len(parts) != 2:
+        return
+    slot_id = parts[1]
+    if slot_id in st["done"]:
+        await query.edit_message_reply_markup(reply_markup=None)
+        return
+    glasses = SLOT_GLASSES.get(slot_id, 1)
+    st["done"].add(slot_id)
+    st["count"] += glasses
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"✅ Отлично! Засчитано {glasses} стакан(а/ов).\n{progress_line(chat_id)}"
+    )
+
+# --- Keep-alive сервер чтобы Render не засыпал ---
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, format, *args):
+        pass  # отключаем лишние логи
+
+def run_health_server():
+    port = int(os.getenv("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    server.serve_forever()
+# -------------------------------------------------
+
+def main():
+    token = os.getenv("BOT_TOKEN")
+    if not token:
+        raise RuntimeError("Нет BOT_TOKEN. Сделай: export BOT_TOKEN='твой_токен'")
+
+    # Запускаем веб-сервер в фоновом потоке
+    thread = threading.Thread(target=run_health_server, daemon=True)
+    thread.start()
+    print(f"Health server started ✅")
+
+    app = Application.builder().token(token).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("on", on_cmd))
+    app.add_handler(CommandHandler("off", off_cmd))
+    app.add_handler(CommandHandler("plan", plan_cmd))
+    app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CallbackQueryHandler(done_callback, pattern=r"^done\|"))
+
+    print("BOT STARTED ✅")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()def today_key() -> str:
     return datetime.now(TZ).date().isoformat()
 
 def ensure_state(chat_id: int) -> dict:
